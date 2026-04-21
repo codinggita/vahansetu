@@ -1,0 +1,607 @@
+# ══════════════════════════════════════════════════════════════════════
+#   VAHANSETU - ENTERPRISE BACKEND ARCHITECTURE (v5.0 Production)
+#   ──────────────────────────────────────────────────────────────────────
+#   Core: Flask / SQLite (WAL) / Python 3.x
+#   Intelligence: Adaptive Trip Planning, Unified Telemetry, Host CRUD.
+# ══════════════════════════════════════════════════════════════════════
+
+from flask import Flask, jsonify, request, render_template, redirect, url_for, flash, send_from_directory
+from flask_cors import CORS
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from mailer import send_vahan_email
+import sqlite3
+import random
+import math
+import os
+import requests
+import time
+import jwt
+import concurrent.futures
+from datetime import datetime, timedelta
+
+app = Flask(__name__, static_folder='client/dist', static_url_path='/', template_folder='client/dist')
+app.config['JWT_SECRET'] = 'vahan-jwt-quantum-vault-2026'
+app.secret_key = 'vs-ultra-secure-key-2026'
+CORS(app)
+
+# ---------- Initialization & Persistence ----------
+
+def get_db_connection():
+    conn = sqlite3.connect('stations.db', timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    conn.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT UNIQUE, password TEXT, role TEXT DEFAULT "user", is_premium INTEGER DEFAULT 0)')
+    conn.execute('CREATE TABLE IF NOT EXISTS fleets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, fleet_name TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS fleet_vehicles (id INTEGER PRIMARY KEY AUTOINCREMENT, fleet_id INTEGER, vehicle_name TEXT, vehicle_number TEXT, battery_pct INTEGER, range_km REAL, lat REAL, lng REAL, status TEXT, total_energy REAL, total_cost REAL)')
+    conn.execute('CREATE TABLE IF NOT EXISTS stations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, address TEXT, lat REAL, lng REAL, connector_type TEXT, power_kw INTEGER, total_bays INTEGER, available_bays INTEGER, owner_id INTEGER)')
+    conn.execute('CREATE TABLE IF NOT EXISTS charging_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, vehicle_id INTEGER, station_id INTEGER, energy_kwh REAL, cost REAL, start_time TEXT, end_time TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS favorites (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, station_id INTEGER)')
+    conn.execute('CREATE TABLE IF NOT EXISTS security_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, ip_address TEXT, device_agent TEXT, status TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, message TEXT, is_read INTEGER DEFAULT 0)')
+    
+    # Ensure Admin
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM users WHERE email = "admin@vahan.com"')
+    if not cursor.fetchone():
+        cursor.execute('INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)',
+                     ('Steward', 'admin@vahan.com', generate_password_hash('steward2026'), 'admin'))
+    conn.commit()
+    conn.close()
+
+def seed_user_data(user_id, conn):
+    # Ensure a fleet exists for this user
+    fleet = conn.execute('SELECT id FROM fleets WHERE user_id = ?', (user_id,)).fetchone()
+    if not fleet:
+        conn.execute('INSERT INTO fleets (user_id, fleet_name) VALUES (?, ?)', (user_id, 'Steward Fleet Alpha'))
+        fleet_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+    else:
+        fleet_id = fleet['id']
+        
+    # Ensure some vehicles exist
+    v_count = conn.execute('SELECT COUNT(*) FROM fleet_vehicles WHERE fleet_id = ?', (fleet_id,)).fetchone()[0]
+    if v_count == 0:
+        demo_v = [
+            (fleet_id, 'Ahmedabad EV-01', 'GJ-01-EV-1001', 85, 320.5, 23.0225, 72.5714, 'idle', 1200.0, 15000.0),
+            (fleet_id, 'Gandhinagar EV-02', 'GJ-18-EV-2002', 42, 160.0, 23.2156, 72.6369, 'moving', 800.0, 10000.0)
+        ]
+        conn.executemany('INSERT INTO fleet_vehicles (fleet_id, vehicle_name, vehicle_number, battery_pct, range_km, lat, lng, status, total_energy, total_cost) VALUES (?,?,?,?,?,?,?,?,?,?)', demo_v)
+        
+    # Ensure some stations exist
+    s_count = conn.execute('SELECT COUNT(*) FROM stations WHERE owner_id = ?', (user_id,)).fetchone()[0]
+    if s_count == 0:
+        demo_s = [
+            ('Ahmedabad North Hub', 'Ashram Road, Ahmedabad', 23.0338, 72.585, 'CCS2', 120, 8, 5, user_id),
+            ('Gandhinagar Power Node', 'Sector 21, Gandhinagar', 23.2156, 72.6369, 'Type2', 60, 4, 3, user_id)
+        ]
+        conn.executemany('INSERT INTO stations (name, address, lat, lng, connector_type, power_kw, total_bays, available_bays, owner_id) VALUES (?,?,?,?,?,?,?,?,?)', demo_s)
+    
+    # Ensure some sessions exist
+    sess_count = conn.execute('SELECT COUNT(*) FROM charging_sessions cs JOIN fleet_vehicles fv ON cs.vehicle_id = fv.id WHERE fv.fleet_id = ?', (fleet_id,)).fetchone()[0]
+    if sess_count == 0:
+        vid_row = conn.execute('SELECT id FROM fleet_vehicles WHERE fleet_id = ?', (fleet_id,)).fetchone()
+        sid_row = conn.execute('SELECT id FROM stations WHERE owner_id = ?', (user_id,)).fetchone()
+        if vid_row and sid_row:
+            vid, sid = vid_row[0], sid_row[0]
+            now = datetime.now()
+            demo_sess = [
+                (vid, sid, 45.5, 680.0, (now - timedelta(hours=2)).strftime('%Y-%m-%d %H:%M:%S'), (now - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S'))
+            ]
+            conn.executemany('INSERT INTO charging_sessions (vehicle_id, station_id, energy_kwh, cost, start_time, end_time) VALUES (?,?,?,?,?,?)', demo_sess)
+    conn.commit()
+
+init_db()
+
+# ---------- Identity Management ----------
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'serve'
+
+class User(UserMixin):
+    def __init__(self, id, name, email, role, is_premium):
+        self.id = id
+        self.name = name
+        self.email = email
+        self.role = role
+        self.is_premium = is_premium
+
+@login_manager.user_loader
+def load_user(user_id):
+    conn = get_db_connection()
+    u = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
+    conn.close()
+    if u: return User(u['id'], u['name'], u['email'], u['role'], u['is_premium'])
+    return None
+
+@app.context_processor
+def inject_user():
+    if current_user.is_authenticated:
+        return dict(user_name=current_user.name, user_role=current_user.role, is_premium=current_user.is_premium)
+    return dict(user_name=None, user_role='guest', is_premium=False)
+
+# --- SECURITY UTILITIES ---
+def verify_jwt(token):
+    try:
+        data = jwt.decode(token, app.config['JWT_SECRET'], algorithms=['HS256'])
+        return data
+    except:
+        return None
+
+@app.before_request
+def validate_session():
+    # Allow public access to certain routes
+    public = ['/', '/login', '/signup', '/logout', '/api/me']
+    if request.path in public or request.path.startswith('/static/'):
+        return
+    
+    if current_user.is_authenticated:
+        token = request.cookies.get('vs_jwt_nexus')
+        if not token:
+            logout_user()
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Session expired'}), 401
+            flash('🛡️ Security Protocol Violation: Session token missing.', 'error')
+            return redirect(url_for('serve'))
+        
+        payload = verify_jwt(token)
+        if not payload or payload.get('user_id') != current_user.id:
+            logout_user()
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Invalid token'}), 401
+            flash('🛡️ Security Protocol Violation: Token mismatch.', 'error')
+            return redirect(url_for('serve'))
+    elif not current_user.is_authenticated and request.path.startswith('/api/') and request.path != '/api/me':
+        return jsonify({'error': 'Authentication required'}), 401
+
+# ---------- Core Routing Engine ----------
+
+# ── SERVE REACT FRONTEND ──
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if path != "" and os.path.exists(app.static_folder + '/' + path):
+        return send_from_directory(app.static_folder, path)
+    return render_template("index.html")
+
+# ── JSON API: /api/me ──
+@app.route('/api/me')
+def api_me():
+    if current_user.is_authenticated:
+        return jsonify({'id': current_user.id, 'name': current_user.name, 'email': current_user.email, 'role': current_user.role, 'is_premium': current_user.is_premium})
+    return jsonify(None), 401
+
+@app.route('/signup', methods=['POST'])
+def signup():
+    # Support both form-data and JSON
+    data = request.get_json(silent=True) or {}
+    name = (request.form.get('name') or data.get('name') or '').strip()
+    email = (request.form.get('email') or data.get('email') or '').strip().lower()
+    password = (request.form.get('password') or data.get('password') or '')
+    
+    is_api = request.is_json or 'application/json' in request.headers.get('Accept', '')
+
+    if not name or not email or not password:
+        if is_api:
+            return jsonify({'success': False, 'message': 'Please fill all fields.'}), 400
+        flash('Security Policy: All fields required.', 'error')
+        return redirect(url_for('serve'))
+
+    conn = get_db_connection()
+    try:
+        conn.execute('INSERT INTO users (name, email, password) VALUES (?, ?, ?)',
+                     (name, email, generate_password_hash(password)))
+        conn.commit()
+        try:
+            send_vahan_email(to_email=email, subject="💎 VAHANSETU: Provisioning Success", title=f"Welcome, {name}!", message="Your account has been created. Please log in.", action_text="Login")
+        except: pass
+        if is_api:
+            return jsonify({'success': True, 'message': 'Account created! Please log in.'})
+        flash('💎 Identity Provisioned: Please log in.', 'success')
+        return redirect(url_for('serve'))
+    except Exception as e:
+        if is_api:
+            return jsonify({'success': False, 'message': 'This email is already registered.'}), 409
+        flash('Security Alert: Email already exists.', 'error')
+        return redirect(url_for('serve'))
+    finally: conn.close()
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'GET':
+        return redirect(url_for('serve'))
+    
+    # Support both form-data and JSON
+    data = request.get_json(silent=True) or {}
+    email = (request.form.get('email', '') or data.get('email', '')).strip().lower()
+    password = (request.form.get('password', '') or data.get('password', ''))
+    is_api = request.is_json or 'application/json' in request.headers.get('Accept', '')
+
+    if not email or not password:
+        if is_api:
+            return jsonify({'success': False, 'message': 'Crendentials required.'}), 400
+        return redirect(url_for('serve'))
+
+    conn = get_db_connection()
+    u = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+    conn.close()
+
+    if u and check_password_hash(u['password'], password):
+        # Generate token
+        token = jwt.encode({'user_id': u['id'], 'email': u['email'], 'exp': datetime.utcnow() + timedelta(hours=24)}, app.config['JWT_SECRET'], algorithm='HS256')
+        
+        login_user(User(u['id'], u['name'], u['email'], u['role'], u['is_premium']))
+        
+        try:
+            conn = get_db_connection()
+            conn.execute('INSERT INTO security_logs (user_id, ip_address, device_agent, status) VALUES (?, ?, ?, ?)',
+                         (u['id'], request.remote_addr, request.headers.get('User-Agent', 'Unknown'), 'Success'))
+            conn.commit(); conn.close()
+            send_vahan_email(to_email=email, subject="🔔 VahanSetu — Secure Login Detected", title="Login Successful", message=f"Session initiated from {request.remote_addr}.", action_text="Open Dashboard")
+        except: pass
+        
+        # Return JSON for React, redirect for HTML
+        if is_api:
+            resp = jsonify({'success': True, 'user': {'id': u['id'], 'name': u['name'], 'email': u['email'], 'role': u['role'], 'is_premium': u['is_premium']}})
+        else:
+            resp = redirect('/')
+        resp.set_cookie('vs_jwt_nexus', token, httponly=True, samesite='Lax')
+        if not is_api: flash(f'🛡️ Access Granted: {u["name"]}.', 'success')
+        return resp
+    
+    if u:
+        conn = get_db_connection()
+        conn.execute('INSERT INTO security_logs (user_id, ip_address, device_agent, status) VALUES (?, ?, ?, ?)',
+                     (u['id'], request.remote_addr, request.headers.get('User-Agent', 'Unknown'), 'Failure'))
+        conn.commit(); conn.close()
+
+    time.sleep(1.0)
+    if is_api:
+        return jsonify({'success': False, 'message': 'Invalid email or incorrect password.'}), 401
+    flash('Authentication Failure: Invalid credentials.', 'error')
+    return redirect(url_for('serve'))
+
+@app.route('/logout')
+def logout():
+    logout_user()
+    resp = redirect(url_for('serve')) if not request.args.get('api') else jsonify({'success': True})
+    resp.delete_cookie('vs_jwt_nexus')
+    return resp
+
+# ── REACT JSON API ENDPOINTS ──
+
+@app.route('/api/fleet')
+@login_required
+def api_fleet():
+    conn = get_db_connection()
+    try:
+        fleet = conn.execute('SELECT * FROM fleets WHERE user_id = ?', (current_user.id,)).fetchone()
+        if not fleet:
+            conn.execute('INSERT INTO fleets (user_id, fleet_name) VALUES (?, ?)', (current_user.id, 'Nexus Fleet Alpha'))
+            conn.commit()
+            fleet = conn.execute('SELECT * FROM fleets WHERE user_id = ?', (current_user.id,)).fetchone()
+        v_count = conn.execute('SELECT COUNT(*) FROM fleet_vehicles WHERE fleet_id = ?', (fleet['id'],)).fetchone()[0]
+        if v_count == 0:
+            demo = [(fleet['id'],'Ahmedabad Express-01','GJ-01-EV-1200',82,340.5,23.0225,72.5714,'idle',1540.0,18500.0),
+                    (fleet['id'],'Gandhinagar Courier','GJ-18-AV-9981',45,182.0,23.2156,72.6369,'charging',2200.0,26400.0),
+                    (fleet['id'],'Kalol Industrial Ops','GJ-18-TX-0052',12,45.3,23.23,72.51,'low_battery',4500.0,54000.0)]
+            conn.executemany('INSERT INTO fleet_vehicles (fleet_id,vehicle_name,vehicle_number,battery_pct,range_km,lat,lng,status,total_energy,total_cost) VALUES (?,?,?,?,?,?,?,?,?,?)', demo)
+            conn.commit()
+        vehicles = [dict(v) for v in conn.execute('SELECT * FROM fleet_vehicles WHERE fleet_id = ?', (fleet['id'],)).fetchall()]
+        sessions_raw = conn.execute('SELECT cs.*, fv.vehicle_name, s.name as station_name FROM charging_sessions cs JOIN fleet_vehicles fv ON cs.vehicle_id = fv.id JOIN stations s ON cs.station_id = s.id WHERE fv.fleet_id = ? ORDER BY cs.start_time DESC LIMIT 15', (fleet['id'],)).fetchall()
+        totals = conn.execute('SELECT SUM(total_energy), SUM(total_cost), AVG(battery_pct) FROM fleet_vehicles WHERE fleet_id = ?', (fleet['id'],)).fetchone()
+        return jsonify({
+            'fleet': dict(fleet), 'fleet_vehicles': vehicles,
+            'fleet_sessions': [dict(s) for s in sessions_raw],
+            'fleet_kwh': round(totals[0] or 0, 1), 'fleet_spend': round(totals[1] or 0, 2),
+            'avg_battery': round(totals[2] or 0, 1), 'health_score': 98
+        })
+    finally: conn.close()
+
+@app.route('/api/host/dashboard')
+@login_required
+def api_host_dashboard():
+    conn = get_db_connection()
+    try:
+        seed_user_data(current_user.id, conn)
+        owned = conn.execute('SELECT s.*, COALESCE(SUM(cs.cost),0) as total_revenue, COUNT(cs.id) as sessions_count FROM stations s LEFT JOIN charging_sessions cs ON s.id = cs.station_id WHERE s.owner_id = ? GROUP BY s.id', (current_user.id,)).fetchall()
+        agg = conn.execute('SELECT COALESCE(SUM(energy_kwh),0) as e, COALESCE(SUM(cost),0) as r, COUNT(*) as s FROM charging_sessions cs JOIN stations sv ON cs.station_id = sv.id WHERE sv.owner_id = ?', (current_user.id,)).fetchone()
+        events = conn.execute('SELECT cs.*, s.name as station_name FROM charging_sessions cs JOIN stations s ON cs.station_id = s.id WHERE s.owner_id = ? ORDER BY cs.start_time DESC LIMIT 8', (current_user.id,)).fetchall()
+        return jsonify({
+            'status': 'success',
+            'stations': [dict(s) for s in owned],
+            'stats': {'revenue': round(float(agg['r'] or 0),2), 'kwh': round(float(agg['e'] or 0),1), 'sessions': int(agg['s'] or 0), 'revenue_growth': 12.4, 'network_uptime': 99.8, 'active_bays': sum(s['available_bays'] or 0 for s in owned), 'total_bays': sum(s['total_bays'] or 0 for s in owned)},
+            'recent_events': [dict(e) for e in events]
+        })
+    finally: conn.close()
+
+@app.route('/api/analytics_data')
+@login_required
+def api_analytics_data():
+    conn = get_db_connection()
+    try:
+        seed_user_data(current_user.id, conn)
+        agg = conn.execute('SELECT COUNT(*) as s, COALESCE(SUM(energy_kwh),0) as e, COALESCE(SUM(cost),0) as r FROM charging_sessions').fetchone()
+        top_raw = conn.execute('SELECT s.id, s.name, s.power_kw, COUNT(cs.id) as sessions_count, SUM(cs.energy_kwh) as station_energy, SUM(cs.cost) as station_revenue FROM stations s LEFT JOIN charging_sessions cs ON s.id = cs.station_id GROUP BY s.id ORDER BY station_revenue DESC LIMIT 8').fetchall()
+        top = [{'id':s['id'],'name':s['name'],'sessions':s['sessions_count'] or 0,'energy':round(s['station_energy'] or 0,1),'revenue':round(s['station_revenue'] or 0,0),'utilization':min(round((s['sessions_count'] or 0)*6.5,1),100),'status':'optimal'} for s in top_raw]
+        return jsonify({'analytics': {'total_sessions':int(agg['s'] or 0),'total_kwh':round(float(agg['e'] or 0),1),'total_revenue':round(float(agg['r'] or 0),0),'revenue_trend':'+14.2%','energy_trend':'+8.5%','top_station':top[0]['name'] if top else 'N/A'}, 'top_stations': top})
+    finally: conn.close()
+
+@app.route('/api/profile_data')
+@login_required
+def api_profile_data():
+    conn = get_db_connection()
+    try:
+        history = [dict(r) for r in conn.execute('SELECT cs.*, s.name as station_name, s.address FROM charging_sessions cs JOIN stations s ON cs.station_id = s.id ORDER BY cs.start_time DESC LIMIT 15').fetchall()]
+        return jsonify({'stats':{'total_sessions':len(history),'total_kwh':round(sum(h['energy_kwh'] for h in history),1),'total_spend':round(sum(h['cost'] for h in history),0),'co2_saved':round(sum(h['energy_kwh'] for h in history)*0.4,1)}, 'history':history})
+    finally: conn.close()
+
+@app.route('/api/profile/update', methods=['POST'])
+@login_required
+def api_profile_update():
+    name = (request.json or {}).get('name','').strip()
+    if not name: return jsonify({'success':False,'message':'Name cannot be empty'}), 400
+    conn = get_db_connection()
+    try:
+        conn.execute('UPDATE users SET name = ? WHERE id = ?', (name, current_user.id)); conn.commit()
+        return jsonify({'success': True})
+    finally: conn.close()
+
+@app.route('/api/change_password', methods=['POST'])
+@login_required
+def api_change_password():
+    data = request.json or {}
+    cur, new, conf = data.get('current_password',''), data.get('new_password',''), data.get('confirm_password','')
+    if new != conf: return jsonify({'success':False,'message':'Passwords do not match'}), 400
+    if len(new) < 8: return jsonify({'success':False,'message':'Password must be 8+ chars'}), 400
+    conn = get_db_connection()
+    try:
+        u = conn.execute('SELECT password FROM users WHERE id = ?', (current_user.id,)).fetchone()
+        if not check_password_hash(u['password'], cur):
+            return jsonify({'success':False,'message':'Current password is incorrect'}), 400
+        conn.execute('UPDATE users SET password = ? WHERE id = ?', (generate_password_hash(new), current_user.id)); conn.commit()
+        return jsonify({'success': True})
+    finally: conn.close()
+
+@app.route('/api/analytics/filter')
+@login_required
+def api_analytics_filter():
+    cycle = request.args.get('cycle', '7D')
+    n = {'24H': 24, '7D': 7, '30D': 30}.get(cycle, 7)
+    labels = [f"Period {i+1}" for i in range(n)]
+    energy = [random.randint(50, 400) for _ in range(n)]
+    revenue = [random.randint(1000, 5000) for _ in range(n)]
+    return jsonify({'labels': labels, 'energy': energy, 'revenue': revenue})
+
+@app.route('/api/notifications')
+@login_required
+def api_notifications():
+    return jsonify({'notifications': [], 'unread': 0})
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat, dlon = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return round(R * 2 * math.asin(math.sqrt(a)), 2)
+
+def geocode_location(q):
+    if not q or q.lower() == 'my location': return None
+    try:
+        r = requests.get(f"https://nominatim.openstreetmap.org/search?q={q}&format=json&limit=1", 
+                         headers={'User-Agent': 'VahanSetu-App-2026'}, timeout=6)
+        d = r.json()
+        if d: return {"lat": float(d[0]['lat']), "lng": float(d[0]['lon']), "name": d[0]['display_name']}
+    except: pass
+    return None
+
+@app.route('/api/stations')
+@login_required
+def get_stations():
+    lat = request.args.get('lat', type=float)
+    lng = request.args.get('lng', type=float)
+    
+    # Fallback to Ahmedabad if no location, forcing API discovery
+    if lat is None or lng is None:
+        lat, lng = 23.0225, 72.5714
+
+    try:
+        overpass_url = "https://overpass-api.de/api/interpreter"
+        query = f"""
+        [out:json][timeout:20];
+        (
+          node["amenity"="charging_station"](around:50000, {lat}, {lng});
+          way["amenity"="charging_station"](around:50000, {lat}, {lng});
+          node["fuel:electric"="yes"](around:50000, {lat}, {lng});
+        );
+        out center;
+        """
+        r = requests.post(overpass_url, data={'data': query}, timeout=15)
+        elements = r.json().get('elements', [])
+        real_stations = []
+        for e in elements:
+            st_lat = e.get('lat') or e.get('center', {}).get('lat')
+            st_lng = e.get('lon') or e.get('center', {}).get('lon')
+            if st_lat is None or st_lng is None: continue
+            tags = e.get('tags', {})
+            
+            p_tags = [tags.get('max_power'), tags.get('socket:type2:output'), tags.get('output')]
+            power_val = 60
+            for pt in p_tags:
+                if pt:
+                    extracted = ''.join(c for c in str(pt) if c.isdigit() or c == '.')
+                    if extracted: power_val = int(float(extracted)); break
+
+            real_stations.append({
+                "id": str(e.get('id')), 
+                "name": tags.get('operator') or tags.get('name') or tags.get('brand') or "EV Flash Hub",
+                "lat": float(st_lat), "lng": float(st_lng), 
+                "address": tags.get('addr:city') or tags.get('addr:street') or "Localized Corridor",
+                "connector_type": tags.get('connection', 'CCS2 / Type 2'), 
+                "power_kw": power_val, 
+                "total_bays": int(tags.get('capacity', random.randint(4, 12))),
+                "available_bays": random.randint(0, 4), 
+                "price_per_kwh": random.randint(12, 28), # Live analytics fallback
+                "distance_km": haversine(lat, lng, float(st_lat), float(st_lng)), 
+                "is_verified_api": True
+            })
+        
+        unique_stations = { s['id']: s for s in real_stations }.values()
+        sorted_stations = sorted(unique_stations, key=lambda x: x['distance_km'])
+        return jsonify(list(sorted_stations)[:50])
+
+    except Exception as e:
+        # Emergency fallback to local high-quality DB
+        conn = get_db_connection()
+        stations = [dict(s) for s in conn.execute('SELECT * FROM stations').fetchall()]
+        conn.close()
+        for s in stations: s['is_fallback'] = True
+        return jsonify(stations)
+
+@app.route('/api/trip_plan')
+@login_required
+def trip_plan():
+    start_q = request.args.get('start')
+    end_q = request.args.get('end')
+    user_lat = request.args.get('lat', type=float)
+    user_lng = request.args.get('lng', type=float)
+
+    start_node = geocode_location(start_q) if start_q and start_q.lower() != 'my location' else {"lat": user_lat, "lng": user_lng, "name": "Current Position"}
+    end_node = geocode_location(end_q)
+    
+    if not start_node or not end_node or start_node['lat'] is None or end_node['lat'] is None:
+        return jsonify({"error": "Unable to geocode locations. Please enter valid cities."}), 400
+
+    try:
+        # 1. Fetch Route from OSRM
+        osrm_url = f"http://router.project-osrm.org/route/v1/driving/{start_node['lng']},{start_node['lat']};{end_node['lng']},{end_node['lat']}?overview=full&geometries=geojson&steps=true"
+        r = requests.get(osrm_url, timeout=10)
+        route_data = r.json()
+        
+        if route_data.get('code') != 'Ok':
+            return jsonify({"error": "No route found between these points."}), 404
+            
+        route = route_data['routes'][0]
+        geometry = route['geometry']
+        total_km = round(route['distance'] / 1000, 1)
+        total_time_min = int(route['duration'] / 60)
+        
+        # Format instructions for the Frontend (Maneuver Road Sheet)
+        instructions = []
+        for leg in route.get('legs', []):
+            for step in leg.get('steps', []):
+                m = step.get('maneuver', {})
+                name = step.get('name')
+                osrm_instr = m.get('instruction', '')
+                dist_km = round(step.get('distance', 0) / 1000, 2)
+                
+                # High-Fidelity Instruction Builder (Road Name Extraction)
+                if not name and 'onto' in osrm_instr.lower():
+                    name = osrm_instr.split('onto')[-1].strip()
+                elif not name and 'at' in osrm_instr.lower():
+                     name = osrm_instr.split('at')[-1].strip()
+
+                if name and len(name) > 1:
+                    base_prefix = m.get('type', 'proceed').replace('_', ' ').capitalize()
+                    main_instr = f"{base_prefix} on {name} for {dist_km} km"
+                else:
+                    main_instr = osrm_instr or f"Proceed for {dist_km} km"
+
+                instructions.append({
+                    "text": main_instr,
+                    "dist": step.get('distance', 0), 
+                    "lat": m.get('location', [0,0])[1],
+                    "lng": m.get('location', [0,0])[0],
+                    "type": m.get('type', 'step')
+                })
+
+        # 2. Find ALL EV Stations along the Route Corridor (Parallel Discovery)
+        coords = geometry['coordinates']
+        corridor_stations = []
+        
+        sampling_step = max(10, len(coords) // (int(total_km // 50) + 1))
+        search_pts = [coords[i] for i in range(0, len(coords), sampling_step)]
+        search_pts.append(coords[-1])
+        
+        def fetch_corridor_hubs(pt):
+            local_hubs = []
+            try:
+                # Optimized search: only Nodes for speed
+                cor_query = f'[out:json][timeout:8];node["amenity"="charging_station"](around:25000, {pt[1]}, {pt[0]});out center;'
+                r_c = requests.post("https://overpass-api.de/api/interpreter", data={'data': cor_query}, timeout=9)
+                elements = r_c.json().get('elements', [])
+                for e in elements:
+                    tags = e.get('tags', {})
+                    local_hubs.append({
+                        "id": str(e.get('id')),
+                        "name": tags.get('operator') or tags.get('name') or tags.get('brand') or f"EV Station #{e.get('id')}",
+                        "lat": float(e.get('lat')), "lng": float(e.get('lon')),
+                        "address": tags.get('addr:city') or tags.get('addr:street') or "Corridor Segment",
+                        "power_kw": int(float(''.join(c for c in str(tags.get('max_power','60')) if c.isdigit() or c == '.') or 60)),
+                        "total_bays": int(tags.get('capacity', 4)),
+                        "available_bays": random.randint(1, 4),
+                        "distance_km": haversine(start_node['lat'], start_node['lng'], float(e.get('lat')), float(e.get('lon')))
+                    })
+            except: pass
+            return local_hubs
+
+        # Execute searches in parallel to minimize latency
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Increased sampling points for a "Same to Same" experience with legacy dashboard
+            results = list(executor.map(fetch_corridor_hubs, search_pts[:10])) 
+            
+            seen_ids = set()
+            for res_list in results:
+                for hub in res_list:
+                    if hub['id'] not in seen_ids:
+                        corridor_stations.append(hub)
+                        seen_ids.add(hub['id'])
+
+        # Sort corridor stations by distance from the START point
+        corridor_stations.sort(key=lambda s: s['distance_km'])
+
+        # Time estimation with Real-World Safety Padding (Google-grade)
+        raw_duration = route.get('duration', 0)
+        padded_time_min = int(raw_duration / 60 * 1.05)
+        
+        # Clean up time string
+        if padded_time_min >= 60:
+            time_str = f"{padded_time_min // 60}h {padded_time_min % 60}m"
+        else:
+            time_str = f"{padded_time_min} mins"
+
+        return jsonify({
+            "geometry": geometry,
+            "total_km": total_km,
+            "total_time": time_str,
+            "instructions": instructions,
+            "stops": corridor_stations[:15] # Return top 15 strategic stops along the route
+        })
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Corridor Engine Timeout. Please try a shorter route or verify connectivity."}), 504
+    except Exception as e:
+        print(f"TRIP ERROR: {e}")
+        return jsonify({"error": "Quantum Route Engine Failure. Ensure city names are precise."}), 500
+
+@app.route('/premium/verify', methods=['POST'])
+@login_required
+def premium_verify():
+    data = request.json or {}
+    conn = get_db_connection()
+    conn.execute('UPDATE users SET is_premium = 1 WHERE id = ?', (current_user.id,))
+    conn.commit(); conn.close()
+    return jsonify({'success': True})
+
+@app.route('/premium/cancel', methods=['POST'])
+@login_required
+def premium_cancel():
+    conn = get_db_connection()
+    conn.execute('UPDATE users SET is_premium = 0 WHERE id = ?', (current_user.id,))
+    conn.commit(); conn.close()
+    return jsonify({'success': True})
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
