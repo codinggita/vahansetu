@@ -1,7 +1,9 @@
 import sqlite3
 from werkzeug.security import generate_password_hash
 
-conn = sqlite3.connect('stations.db')
+import os
+db_path = os.path.join(os.path.dirname(__file__), 'stations.db')
+conn = sqlite3.connect(db_path)
 cursor = conn.cursor()
 
 # --- Helper to add column if missing ---
@@ -112,15 +114,27 @@ cursor.execute('''
     )
 ''')
 
+# --- Notifications table ---
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        message TEXT,
+        is_read INTEGER DEFAULT 0,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+''')
+
 # Insert sample stations only if table is empty
 cursor.execute('SELECT COUNT(*) FROM stations')
 if cursor.fetchone()[0] == 0:
     sample_stations = [
-        ('Tata Power - Koramangala', 12.9352, 77.6245, 'Koramangala, Bengaluru', 'CCS2', 60, 4, 2, 1, '', '', 'city'),
-        ('HP e-Charge - Indiranagar', 12.9784, 77.6408, 'Indiranagar, Bengaluru', 'CCS2', 30, 2, 1, 1, '', '', 'city'),
-        ('chargeMOD - MG Road', 12.9759, 77.6065, 'MG Road, Bengaluru', 'Type2', 22, 3, 3, 0, '', '', 'city'),
-        ('Statiq - HSR Layout', 12.9115, 77.6447, 'HSR Layout, Bengaluru', 'CHAdeMO', 50, 2, 0, 2, '', '', 'city'),
-        ('Tata Power - Whitefield', 12.9698, 77.7500, 'Whitefield, Bengaluru', 'CCS2', 120, 1, 1, 0, '', '', 'highway'),
+        ('Solaris Hub North', 23.0338, 72.5850, 'Ashram Road, Ahmedabad', 'CCS2', 150, 12, 8, 0, '', '', 'city'),
+        ('Kalol Central Plaza', 23.2350, 72.5110, 'Kalol Highway, Gujarat', 'CCS2', 120, 10, 6, 0, '', '', 'city'),
+        ('Nexus Gandhinagar', 23.2156, 72.6369, 'Sector 21, Gandhinagar', 'Type2', 60, 6, 2, 0, '', '', 'city'),
+        ('Skyline Highway Node', 22.7500, 72.6800, 'NH-48, Kheda', 'CCS2', 240, 4, 1, 0, '', '', 'highway'),
+        ('EV Flash - Sanand', 22.9800, 72.3800, 'Sanand GIDC, Gujarat', 'CCS2', 100, 8, 4, 0, '', '', 'city'),
     ]
     cursor.executemany('''
         INSERT INTO stations (name, lat, lng, address, connector_type, power_kw, total_bays, available_bays, queue_length, image_url, opening_hours, station_type)
