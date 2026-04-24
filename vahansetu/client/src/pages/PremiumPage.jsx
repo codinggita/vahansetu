@@ -3,8 +3,7 @@ import Navbar from '../components/Navbar';
 import { 
   ShieldCheck, Zap, Sparkles, Check, X, Rocket, Diamond, 
   MapPin, Clock, Shield, Cpu, Navigation2, Radio, BarChart2, ShieldOff, 
-  CheckCircle, Headphones, Gift, Target, PieChart, HeadphonesIcon,
-  Activity, Car, Settings2, Lock
+  CheckCircle, Headphones, Gift, Target, PieChart, HeadphonesIcon
 } from 'lucide-react';
 import { api, showToast } from '../api';
 import { useAuth } from '../context/AuthContext';
