@@ -254,6 +254,10 @@ def api_me():
         return jsonify({'id': current_user.id, 'name': current_user.name, 'email': current_user.email, 'role': current_user.role, 'is_premium': current_user.is_premium})
     return jsonify(None), 401
 
+@app.route('/test-api')
+def test_api():
+    return jsonify({'status': 'ok', 'message': 'VahanSetu Production Engine Live'})
+
 @app.route('/signup', methods=['GET', 'POST'], strict_slashes=False)
 def signup():
     if request.method == 'GET':
