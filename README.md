@@ -109,7 +109,3 @@ VahanSetu is optimized for one-click deployment on Render.
 - **Environment Isolation**: Uses `python-dotenv` for managing secure keys.
 - **Diagnostic API**: Visit `/health` to verify database connectivity and frontend integrity.
 - **Emergency Fallback**: The UI includes a safety net that serves high-fidelity demo data if the primary database node is inaccessible.
-
----
-
-Designed with ❤️ for the future of Indian EV Mobility. 🇮🇳
