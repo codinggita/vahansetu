@@ -24,7 +24,7 @@ import concurrent.futures
 from datetime import datetime, timedelta
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, 'vahansetu', 'client', 'dist')
+STATIC_DIR = os.path.join(BASE_DIR, 'client', 'dist')
 
 app = Flask(__name__, 
             static_folder=STATIC_DIR, 
@@ -35,7 +35,7 @@ app.secret_key = os.getenv('SECRET_KEY', 'vs-ultra-secure-key-2026')
 CORS(app, supports_credentials=True)
 app.url_map.strict_slashes = False
 
-# ΓöÇΓöÇ VAHAN INTELLIGENCE: SIMULATION & PREDICTION ENGINE ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+# --- VAHAN INTELLIGENCE: SIMULATION & PREDICTION ENGINE ---
 class VahanIntelligence:
     @staticmethod
     def get_predictive_pricing():
@@ -76,8 +76,8 @@ def run_simulations():
             time.sleep(30) # Pulse every 30 seconds
         except: pass
 
-import threading
-threading.Thread(target=run_simulations, daemon=True).start()
+# Simulation thread will be started after init_db()
+sim_thread = None
 
 # ---------- Initialization & Persistence ----------
 
@@ -200,7 +200,13 @@ def seed_user_data(user_id, conn):
 
     conn.commit()
 
+# Ensure DB is initialized
 init_db()
+
+# Start Simulation background thread AFTER DB is ready
+import threading
+threading.Thread(target=run_simulations, daemon=True).start()
+
 
 # ---------- Identity Management ----------
 
@@ -251,7 +257,7 @@ def validate_session():
             logout_user()
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'Session expired'}), 401
-            flash('≡ƒ¢í∩╕Å Security Protocol Violation: Session token missing.', 'error')
+            flash('Security Protocol Violation: Session token missing.', 'error')
             return redirect(url_for('serve'))
         
         payload = verify_jwt(token)
@@ -259,7 +265,7 @@ def validate_session():
             logout_user()
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'Invalid token'}), 401
-            flash('≡ƒ¢í∩╕Å Security Protocol Violation: Token mismatch.', 'error')
+            flash('Security Protocol Violation: Token mismatch.', 'error')
             return redirect(url_for('serve'))
     elif not current_user.is_authenticated and request.path.startswith('/api/') and request.path != '/api/me':
         return jsonify({'error': 'Authentication required'}), 401
@@ -268,7 +274,7 @@ def validate_session():
 
 
 
-# ΓöÇΓöÇ JSON API: /api/me ΓöÇΓöÇ
+# --- JSON API: /api/me ---
 @app.route('/api/me')
 def api_me():
     if current_user.is_authenticated:
@@ -278,6 +284,34 @@ def api_me():
 @app.route('/test-api')
 def test_api():
     return jsonify({'status': 'ok', 'message': 'VahanSetu Production Engine Live'})
+
+@app.route('/health')
+def health_check():
+    health = {
+        'status': 'healthy',
+        'database': 'unknown',
+        'filesystem': 'unknown',
+        'static_folder': app.static_folder,
+        'index_exists': os.path.exists(os.path.join(app.static_folder, 'index.html'))
+    }
+    try:
+        conn = get_db_connection()
+        conn.execute('SELECT 1').fetchone()
+        conn.close()
+        health['database'] = 'connected'
+    except Exception as e:
+        health['database'] = f'error: {str(e)}'
+        health['status'] = 'degraded'
+    
+    return jsonify(health)
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # Pass through HTTP errors
+    if hasattr(e, 'code'): return jsonify({'error': str(e), 'code': e.code}), e.code
+    import traceback
+    print(traceback.format_exc())
+    return jsonify({'error': 'Internal Server Error', 'details': str(e)}), 500
 
 @app.route('/signup', methods=['GET', 'POST'], strict_slashes=False)
 def signup():
@@ -303,11 +337,11 @@ def signup():
                      (name, email, generate_password_hash(password)))
         conn.commit()
         try:
-            send_vahan_email(to_email=email, subject="≡ƒÆÄ VAHANSETU: Provisioning Success", title=f"Welcome, {name}!", message="Your account has been created. Please log in.", action_text="Login")
+            send_vahan_email(to_email=email, subject="VAHANSETU: Provisioning Success", title=f"Welcome, {name}!", message="Your account has been created. Please log in.", action_text="Login")
         except: pass
         if is_api:
             return jsonify({'success': True, 'message': 'Account created! Please log in.'})
-        flash('≡ƒÆÄ Identity Provisioned: Please log in.', 'success')
+        flash('Identity Provisioned: Please log in.', 'success')
         return redirect(url_for('serve'))
     except Exception as e:
         if is_api:
@@ -347,7 +381,7 @@ def login():
             conn.execute('INSERT INTO security_logs (user_id, ip_address, device_agent, status) VALUES (?, ?, ?, ?)',
                          (u['id'], request.remote_addr, request.headers.get('User-Agent', 'Unknown'), 'Success'))
             conn.commit(); conn.close()
-            send_vahan_email(to_email=email, subject="≡ƒöö VahanSetu ΓÇö Secure Login Detected", title="Login Successful", message=f"Session initiated from {request.remote_addr}.", action_text="Open Dashboard")
+            send_vahan_email(to_email=email, subject="VahanSetu - Secure Login Detected", title="Login Successful", message=f"Session initiated from {request.remote_addr}.", action_text="Open Dashboard")
         except: pass
         
         # Return JSON for React, redirect for HTML
@@ -356,7 +390,7 @@ def login():
         else:
             resp = redirect('/')
         resp.set_cookie('vs_jwt_nexus', token, httponly=True, samesite='Lax')
-        if not is_api: flash(f'≡ƒ¢í∩╕Å Access Granted: {u["name"]}.', 'success')
+        if not is_api: flash(f'Access Granted: {u["name"]}.', 'success')
         return resp
     
     if u:
@@ -1110,13 +1144,21 @@ def get_digital_twin(vehicle_id):
         'timestamp': datetime.now().isoformat()
     })
 
-# ΓöÇΓöÇ SERVE REACT FRONTEND ΓöÇΓöÇ
+# --- SERVE REACT FRONTEND ---
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
-    if path != "" and os.path.exists(app.static_folder + '/' + path):
+    # Security: check if path exists in static folder
+    full_path = os.path.join(app.static_folder, path)
+    if path != "" and os.path.exists(full_path):
         return send_from_directory(app.static_folder, path)
-    return render_template("index.html")
+    
+    # Fallback to index.html for React SPA routing
+    index_path = os.path.join(app.static_folder, 'index.html')
+    if os.path.exists(index_path):
+        return send_from_directory(app.static_folder, 'index.html')
+    
+    return f"<h1>VahanSetu Engine Live</h1><p>Frontend artifacts missing at: {app.static_folder}</p><p>Please check build logs.</p>", 404
 
 if __name__ == '__main__':
     init_db()
